@@ -17,11 +17,13 @@ RTC_DS3231 rtc;
 #define TIME_CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
 #define CONFIG_CHARACTERISTIC_UUID "dcba4321-8765-4321-abcd-0987654321ef"
 #define TEST_CHARACTERISTIC_UUID "efab4321-8765-4321-abcd-0987654321ff"
+#define LOG_CHARACTERISTIC_UUID "fedcba98-7654-3210-fedc-ba9876543210"
 
 BLEServer *pServer = NULL;
 BLECharacteristic *timeCharacteristic = NULL;
 BLECharacteristic *configCharacteristic = NULL;
 BLECharacteristic *testCharacteristic = NULL;
+BLECharacteristic *logCharacteristic = NULL;
 bool deviceConnected = false;
 
 // ✅ Pinos das bombas (ajuste conforme seu circuito)
@@ -177,6 +179,15 @@ class TimeCharacteristicCallbacks : public BLECharacteristicCallbacks {
     } else {
       Serial.println("❌ [TimeCharacteristic] Formato de hora inválido! Esperado: HH:MM:SS");
     }
+  }
+};
+
+class LogCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *pCharacteristic) override {
+    String log = preferences.getString("pump_log", "");
+    pCharacteristic->setValue(log.c_str());
+    Serial.println("📤 [LogCharacteristic] Leitura solicitada, enviando log:");
+    Serial.println(log);
   }
 };
 
@@ -360,6 +371,13 @@ void setup() {
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
   configCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
+
+  // ✅ Nova Característica de Log (Apenas Leitura)
+  logCharacteristic = pService->createCharacteristic(
+    LOG_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ
+  );
+  logCharacteristic->setCallbacks(new LogCharacteristicCallbacks());
   
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();

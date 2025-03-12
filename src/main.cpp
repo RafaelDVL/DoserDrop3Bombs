@@ -26,8 +26,8 @@ bool deviceConnected = false;
 
 // ✅ Pinos das bombas (ajuste conforme seu circuito)
 #define BOMBA1_PIN 5
-#define BOMBA2_PIN 18
-#define BOMBA3_PIN 19
+#define BOMBA2_PIN 19
+#define BOMBA3_PIN 18
 
 // ✅ Estrutura das Bombas
 struct Bomb {
@@ -43,6 +43,31 @@ Bomb bombas[3];
 bool bombaJaAcionada[3] = { false, false, false };
 
 Preferences preferences; // Para salvar as configurações na memória flash
+
+// ===================
+// Função de Log de Acionamento
+// ===================
+
+void logAcionamento(int bombaIndex, float dosagem, String origem) {
+  DateTime now = rtc.now();
+  char buffer[50];
+  sprintf(buffer, "%02d/%02d - %02d:%02d - Bomba %d - %.1fmls - %s", 
+          now.day(), now.month(), now.hour(), now.minute(), bombaIndex + 1, dosagem, origem.c_str());
+  String newEntry = String(buffer);
+  
+  // Recupera o log atual da memória flash
+  String log = preferences.getString("pump_log", "");
+  if (log.length() > 0) {
+    log += "\n";
+  }
+  log += newEntry;
+  
+  // Salva o log atualizado na flash
+  preferences.putString("pump_log", log);
+  
+  Serial.println("✅ [logAcionamento] Registro salvo:");
+  Serial.println(newEntry);
+}
 
 // Função para carregar configuração das bombas salvas na memória flash
 void loadBombasConfig() {
@@ -90,7 +115,8 @@ void loadBombasConfig() {
 // Métodos de Acionamento
 // ===================
 
-void acionarBomba(int bombaIndex, float dosagem) {
+// Agora a função recebe um parâmetro a mais "origem" para identificar o tipo de acionamento
+void acionarBomba(int bombaIndex, float dosagem, String origem) {
   if (bombaIndex < 0 || bombaIndex >= 3) {
     Serial.println("❌ [acionarBomba] Índice de bomba inválido!");
     return;
@@ -108,6 +134,9 @@ void acionarBomba(int bombaIndex, float dosagem) {
   delay(tempoAtivacao);
   digitalWrite(pinoBomba, LOW);
   Serial.println("✅ [acionarBomba] Bomba " + String(bombaIndex + 1) + " desligada!");
+  
+  // Registra o acionamento no log
+  logAcionamento(bombaIndex, dosagem, origem);
 }
 
 void testarBomba(int bombIndex, float dosagem) {
@@ -121,7 +150,8 @@ void testarBomba(int bombIndex, float dosagem) {
     return;
   }
   Serial.println("🚰 [testarBomba] Testando Bomba " + String(bombIndex + 1) + " com dosagem: " + String(dosagem));
-  acionarBomba(bombIndex, dosagem);
+  // Aqui chamamos a função de acionamento indicando que se trata de um teste
+  acionarBomba(bombIndex, dosagem, "Teste");
 }
 
 // ===================
@@ -270,7 +300,6 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-
 // ===================
 // Inicialização
 // ===================
@@ -370,7 +399,8 @@ void loop() {
       if (bombas[i].hour == now.hour() && bombas[i].minute == now.minute()) {
         if (bombas[i].diasSemana[diaSemana]) {
           Serial.printf("⏳ Acionando bomba %d às %02d:%02d no dia %d\n", i + 1, now.hour(), now.minute(), diaSemana);
-          acionarBomba(i, bombas[i].dosagem);
+          // Aqui indicamos que o acionamento é "Programado"
+          acionarBomba(i, bombas[i].dosagem, "Programado");
           bombaJaAcionada[i] = true;
         } else {
           Serial.printf("ℹ️ Bomba %d não acionada: dia %d não habilitado\n", i + 1, diaSemana);

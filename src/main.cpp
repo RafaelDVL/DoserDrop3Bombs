@@ -37,24 +37,38 @@ struct Bomb {
   int minute;
   float dosagem;
   bool diasSemana[7];
-  float calibrCoef = 1.0; // Coeficiente de calibração
+  float calibrCoef;
   bool status;
+  String name;
+  float quantidadeEstoque;
+
+  // Construtor para inicializar corretamente
+  Bomb() {
+    hour = 0;
+    minute = 0;
+    dosagem = 0;
+    calibrCoef = 1.0;
+    status = false;
+    name = "";
+    quantidadeEstoque = 0;
+    for (int i = 0; i < 7; i++) {
+      diasSemana[i] = false;
+    }
+  }
 };
 
+// Inicialmente, os campos novos serão padrão (nome vazio e estoque 0)
 Bomb bombas[3];
+
 bool bombaJaAcionada[3] = { false, false, false };
 
 Preferences preferences; // Para salvar as configurações na memória flash
 
-// ===================
-// Função de Log de Acionamento
-// ===================
-
 void logAcionamento(int bombaIndex, float dosagem, String origem) {
   DateTime now = rtc.now();
-  char buffer[50];
-  sprintf(buffer, "%02d/%02d - %02d:%02d - Bomba %d - %.1fmls - %s", 
-          now.day(), now.month(), now.hour(), now.minute(), bombaIndex + 1, dosagem, origem.c_str());
+  char buffer[100];
+  sprintf(buffer, "%02d/%02d - %02d:%02d - Bomba %d (%s) - %.1fmls - %s", 
+          now.day(), now.month(), now.hour(), now.minute(), bombaIndex + 1, bombas[bombaIndex].name.c_str(), dosagem, origem.c_str());
   String newEntry = String(buffer);
   
   // Recupera o log atual da memória flash
@@ -99,23 +113,30 @@ void loadBombasConfig() {
     bombas[i].dosagem = bomba["dosagem"];
     bombas[i].status = bomba["status"];
     bombas[i].calibrCoef = bomba["calibrCoef"];
-    if (!bomba["diasSemanaSelecionados"].isNull()) {
-      JsonArray dias = bomba["diasSemanaSelecionados"].as<JsonArray>();
-      for (int j = 0; j < 7; j++) {
-        bombas[i].diasSemana[j] = dias[j];
-      }
+    
+    // ✅ Lendo o novo campo "name"
+    if (!bomba["name"].isNull()) {
+      bombas[i].name = String(bomba["name"].as<const char*>());
+    } else {
+      bombas[i].name = "Sem Nome";
     }
+
+    // ✅ Lendo o novo campo "quantidadeEstoque"
+    if (!bomba["quantidadeEstoque"].isNull()) {
+      bombas[i].quantidadeEstoque = bomba["quantidadeEstoque"];
+    } else {
+      bombas[i].quantidadeEstoque = 0;
+    }
+
     Serial.println("✅ [loadBombasConfig] Bomba " + String(i + 1) + " configurada:");
+    Serial.print("   Nome: "); Serial.println(bombas[i].name);
     Serial.print("   Hora: "); Serial.println(bombas[i].hour);
     Serial.print("   Minuto: "); Serial.println(bombas[i].minute);
     Serial.print("   Dosagem: "); Serial.println(bombas[i].dosagem);
     Serial.print("   Calib. Coef.: "); Serial.println(bombas[i].calibrCoef);
+    Serial.print("   Quantidade Estoque: "); Serial.println(bombas[i].quantidadeEstoque);
   }
 }
-
-// ===================
-// Métodos de Acionamento
-// ===================
 
 // Agora a função recebe um parâmetro a mais "origem" para identificar o tipo de acionamento
 void acionarBomba(int bombaIndex, float dosagem, String origem) {
@@ -131,11 +152,22 @@ void acionarBomba(int bombaIndex, float dosagem, String origem) {
     case 2: pinoBomba = BOMBA3_PIN; break;
     default: return;
   }
-  Serial.println("🚰 [acionarBomba] Acionando Bomba " + String(bombaIndex + 1) + " por " + String(tempoAtivacao) + "ms");
+  Serial.println("🚰 [acionarBomba] Acionando Bomba " + String(bombaIndex + 1) + " (" + bombas[bombaIndex].name + ") por " + String(tempoAtivacao) + "ms");
   digitalWrite(pinoBomba, HIGH);
   delay(tempoAtivacao);
   digitalWrite(pinoBomba, LOW);
   Serial.println("✅ [acionarBomba] Bomba " + String(bombaIndex + 1) + " desligada!");
+  
+  // Atualiza o estoque: desconta a dosagem, garantindo que não fique negativo
+  if (bombas[bombaIndex].quantidadeEstoque > 0) {
+    bombas[bombaIndex].quantidadeEstoque -= dosagem;
+    if (bombas[bombaIndex].quantidadeEstoque < 0) {
+      bombas[bombaIndex].quantidadeEstoque = 0;
+    }
+    Serial.print("🔄 [acionarBomba] Novo estoque da bomba "); Serial.print(bombaIndex + 1);
+    Serial.print(" ("); Serial.print(bombas[bombaIndex].name); Serial.print("): ");
+    Serial.println(bombas[bombaIndex].quantidadeEstoque);
+  }
   
   // Registra o acionamento no log
   logAcionamento(bombaIndex, dosagem, origem);
@@ -151,7 +183,7 @@ void testarBomba(int bombIndex, float dosagem) {
     Serial.println("❌ [testarBomba] Dosagem inválida! Deve ser maior que zero.");
     return;
   }
-  Serial.println("🚰 [testarBomba] Testando Bomba " + String(bombIndex + 1) + " com dosagem: " + String(dosagem));
+  Serial.println("🚰 [testarBomba] Testando Bomba " + String(bombIndex + 1) + " (" + bombas[bombIndex].name + ") com dosagem: " + String(dosagem));
   // Aqui chamamos a função de acionamento indicando que se trata de um teste
   acionarBomba(bombIndex, dosagem, "Teste");
 }
@@ -280,6 +312,18 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks {
       bombas[i].dosagem = bomba["dosagem"];
       bombas[i].status = bomba["status"];
       bombas[i].calibrCoef = bomba["calibrCoef"];
+      // NOVOS campos: nome e quantidade de estoque
+      if (!bomba["name"].isNull()) {
+        bombas[i].name = String(bomba["name"].as<const char*>());
+      } else {
+        bombas[i].name = "";
+      }
+      
+      if (!bomba["quantidadeEstoque"].isNull()) {
+        bombas[i].quantidadeEstoque = bomba["quantidadeEstoque"];
+      } else {
+        bombas[i].quantidadeEstoque = 0;
+      }
       if (!bomba["diasSemanaSelecionados"].isNull()) {
         JsonArray dias = bomba["diasSemanaSelecionados"].as<JsonArray>();
         for (int j = 0; j < 7; j++) {
@@ -287,10 +331,12 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks {
         }
       }
       Serial.println("✅ [ConfigCharacteristic] Bomba " + String(i + 1) + " atualizada!");
+      Serial.print("   Nome: "); Serial.println(bombas[i].name);
       Serial.print("   Hora: "); Serial.println(bombas[i].hour);
       Serial.print("   Minuto: "); Serial.println(bombas[i].minute);
       Serial.print("   Dosagem: "); Serial.println(bombas[i].dosagem);
       Serial.print("   Calib. Coef.: "); Serial.println(bombas[i].calibrCoef);
+      Serial.print("   Quantidade Estoque: "); Serial.println(bombas[i].quantidadeEstoque);
     }
     Serial.println("✅ [ConfigCharacteristic] Configuração das bombas atualizada no ESP32!");
 
@@ -416,7 +462,7 @@ void loop() {
     if (bombas[i].status && !bombaJaAcionada[i]) {
       if (bombas[i].hour == now.hour() && bombas[i].minute == now.minute()) {
         if (bombas[i].diasSemana[diaSemana]) {
-          Serial.printf("⏳ Acionando bomba %d às %02d:%02d no dia %d\n", i + 1, now.hour(), now.minute(), diaSemana);
+          Serial.printf("⏳ Acionando bomba %d (%s) às %02d:%02d no dia %d\n", i + 1, bombas[i].name.c_str(), now.hour(), now.minute(), diaSemana);
           // Aqui indicamos que o acionamento é "Programado"
           acionarBomba(i, bombas[i].dosagem, "Programado");
           bombaJaAcionada[i] = true;

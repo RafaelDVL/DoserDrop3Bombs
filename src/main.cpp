@@ -17,11 +17,13 @@ RTC_DS3231 rtc;
 #define TIME_CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
 #define CONFIG_CHARACTERISTIC_UUID "dcba4321-8765-4321-abcd-0987654321ef"
 #define TEST_CHARACTERISTIC_UUID "efab4321-8765-4321-abcd-0987654321ff"
+#define LOG_CHARACTERISTIC_UUID "abcd5678-1234-5678-1234-abcdef123456"
 
 BLEServer *pServer = NULL;
 BLECharacteristic *timeCharacteristic = NULL;
 BLECharacteristic *configCharacteristic = NULL;
 BLECharacteristic *testCharacteristic = NULL;
+BLECharacteristic *logCharacteristic = NULL;
 bool deviceConnected = false;
 
 // ✅ Pinos das bombas (ajuste conforme seu circuito)
@@ -130,6 +132,48 @@ void loadBombasConfig()
   }
 }
 
+void adicionarLog(int bombaIndex, float dosagem, String origem)
+{
+  // Monta o timestamp
+  DateTime now = rtc.now();
+  char timestamp[20];
+  snprintf(timestamp, sizeof(timestamp), "%02d/%02d/%04d %02d:%02d",
+           now.day(), now.month(), now.year(), now.hour(), now.minute());
+
+  // Lê os logs salvos
+  String logsStr = preferences.getString("logs", "[]");
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, logsStr);
+  if (error)
+  {
+    Serial.println("❌ [log] Erro ao carregar logs: " + String(error.c_str()));
+    doc.to<JsonArray>(); // inicia vazio
+  }
+
+  JsonArray logs = doc.as<JsonArray>();
+
+  // Adiciona o novo log
+  JsonObject log = logs.createNestedObject();
+  log["ts"] = timestamp;
+  log["b"] = bombas[bombaIndex].name;
+  log["d"] = dosagem;
+  log["o"] = origem;
+
+  // Limita a quantidade de logs armazenados
+  const int MAX_LOGS = 50;
+  while (logs.size() > MAX_LOGS)
+  {
+    logs.remove(0); // remove o mais antigo
+  }
+
+  // Salva novamente na memória
+  String output;
+  serializeJson(logs, output);
+  preferences.putString("logs", output);
+
+  Serial.println("📝 [log] Log adicionado: " + output);
+}
+
 // Função para acionar a bomba sem registrar log
 void acionarBomba(int bombaIndex, float dosagem, String origem)
 {
@@ -150,6 +194,7 @@ void acionarBomba(int bombaIndex, float dosagem, String origem)
     }
 
   Serial.println("🚰 [acionarBomba] Acionando Bomba " + String(bombaIndex + 1) + " (" + bombas[bombaIndex].name + ") por " + String(tempoAtivacao) + "ms");
+  adicionarLog(bombaIndex, dosagem, origem);
   digitalWrite(pinoBomba, HIGH);
   unsigned long tempoInicio = millis();
     while (millis() - tempoInicio < tempoAtivacao) {}
@@ -193,6 +238,7 @@ void acionarBomba(int bombaIndex, float dosagem, String origem)
   }
 }
 
+
 void testarBomba(int bombIndex, float dosagem)
 {
   Serial.println("🔎 [testarBomba] Teste de Bomba acionado!");
@@ -210,10 +256,6 @@ void testarBomba(int bombIndex, float dosagem)
   // Aqui chamamos a função de acionamento indicando que se trata de um teste
   acionarBomba(bombIndex, dosagem, "Teste");
 }
-
-// ===================
-// Callbacks BLE
-// ===================
 
 class TimeCharacteristicCallbacks : public BLECharacteristicCallbacks
 {
@@ -345,6 +387,7 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks
 
       JsonObject bomba = doc[bombaKey];
 
+      bombas[i].name = bomba.containsKey("name") ? String(bomba["name"].as<const char *>()) : "Sem Nome";
       bombas[i].hour = bomba["time"]["hour"] | 0;
       bombas[i].minute = bomba["time"]["minute"] | 0;
       bombas[i].dosagem = bomba["dosagem"] | 0.0;
@@ -427,6 +470,49 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks
   }
 };
 
+class LogCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+  void onRead(BLECharacteristic *pCharacteristic) override
+  {
+    String logsStr = preferences.getString("logs", "[]");
+
+    // Limitar quantidade para não travar BLE (ex: últimos 10)
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, logsStr);
+    JsonArray fullLogs = doc.as<JsonArray>();
+
+    DynamicJsonDocument smallDoc(512);
+    JsonArray limitedLogs = smallDoc.to<JsonArray>();
+
+    const int MAX_RETURN = 10;
+    int start = std::max(0, static_cast<int>(fullLogs.size()) - MAX_RETURN);
+
+    for (int i = start; i < fullLogs.size(); i++)
+    {
+      limitedLogs.add(fullLogs[i]);
+    }
+
+    String result;
+    serializeJson(limitedLogs, result);
+    pCharacteristic->setValue(result.c_str());
+
+    Serial.println("📤 [log] Enviando últimos logs BLE:");
+    Serial.println(result);
+  }
+
+  void onWrite(BLECharacteristic *pCharacteristic) override
+  {
+    std::string value = pCharacteristic->getValue();
+    if (value == "CLEAR")
+    {
+      preferences.putString("logs", "[]");
+      pCharacteristic->setValue("Logs apagados!");
+      Serial.println("🗑️ [log] Todos os logs foram apagados.");
+    }
+  }
+};
+
+
 // Inicialização
 
 void inicializarBombas()
@@ -486,6 +572,13 @@ void setup()
       CONFIG_CHARACTERISTIC_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
   configCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
+
+  // ✅ Característica de Log (Leitura e Escrita)
+  logCharacteristic = pService->createCharacteristic(
+      LOG_CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  logCharacteristic->setCallbacks(new LogCharacteristicCallbacks());
+
 
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();

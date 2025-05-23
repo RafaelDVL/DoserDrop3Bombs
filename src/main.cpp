@@ -28,8 +28,8 @@ bool deviceConnected = false;
 
 // ✅ Pinos das bombas (ajuste conforme seu circuito)
 #define BOMBA1_PIN 5
-#define BOMBA2_PIN 19
-#define BOMBA3_PIN 18
+#define BOMBA2_PIN 18
+#define BOMBA3_PIN 19
 
 // ✅ Estrutura das Bombas
 struct Bomb
@@ -194,7 +194,7 @@ void acionarBomba(int bombaIndex, float dosagem, String origem)
     }
 
   Serial.println("🚰 [acionarBomba] Acionando Bomba " + String(bombaIndex + 1) + " (" + bombas[bombaIndex].name + ") por " + String(tempoAtivacao) + "ms");
-  adicionarLog(bombaIndex, dosagem, origem);
+  // adicionarLog(bombaIndex, dosagem, origem);
   digitalWrite(pinoBomba, HIGH);
   unsigned long tempoInicio = millis();
     while (millis() - tempoInicio < tempoAtivacao) {}
@@ -484,7 +484,7 @@ class LogCharacteristicCallbacks : public BLECharacteristicCallbacks
     DynamicJsonDocument smallDoc(512);
     JsonArray limitedLogs = smallDoc.to<JsonArray>();
 
-    const int MAX_RETURN = 10;
+    const int MAX_RETURN = 20;
     int start = std::max(0, static_cast<int>(fullLogs.size()) - MAX_RETURN);
 
     for (int i = start; i < fullLogs.size(); i++)
@@ -535,11 +535,12 @@ void setup()
   {
     Serial.println("❌ [setup] Erro ao iniciar o RTC!");
   }
+
   if (rtc.lostPower())
-  {
-    Serial.println("⚠️ [setup] RTC perdeu a alimentação, ajustando data e hora...");
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  }
+{
+  Serial.println("⚠️ [setup] RTC perdeu a alimentação!");
+  Serial.println("⏳ Aguardando ajuste de data e hora via BLE...");
+}
   inicializarBombas();
 
   // Inicializa a memória não volátil

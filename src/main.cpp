@@ -7,23 +7,51 @@
 #include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
 
 // ✅ Variável Global para calibração
 #define TEMPO_POR_ML 700 // Tempo de acionamento da bomba para cada 1ml (em ms)
 
 RTC_DS3231 rtc;
 
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastFirebaseReconnectAttempt = 0;
+const unsigned long firebaseReconnectInterval = 600000;
+
+const char* ssid = "Wifi.Rodrigues";
+const char* password = "@Tearsofthedragon26";
+
+#define MAX_PENDING_LOGS 10
+#define LOG_INTERVAL      500
+struct PendingLog {
+  int      bombaIndex;
+  float    dosagem;
+  String   origem;
+  DateTime timestamp;
+};
+
+PendingLog pendingLogs[MAX_PENDING_LOGS];
+volatile int pendingHead = 0;
+volatile int pendingTail = 0;
+unsigned long lastLogAttempt = 0;
+
+#define API_KEY "AIzaSyDnUQ4Y12V4R7YKjRJtrWI61FmR5-HGSZU"
+#define DATABASE_URL "https://firedoser-default-rtdb.firebaseio.com/"
+
 #define SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
 #define TIME_CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
 #define CONFIG_CHARACTERISTIC_UUID "dcba4321-8765-4321-abcd-0987654321ef"
 #define TEST_CHARACTERISTIC_UUID "efab4321-8765-4321-abcd-0987654321ff"
-#define LOG_CHARACTERISTIC_UUID "abcd5678-1234-5678-1234-abcdef123456"
 
 BLEServer *pServer = NULL;
 BLECharacteristic *timeCharacteristic = NULL;
 BLECharacteristic *configCharacteristic = NULL;
 BLECharacteristic *testCharacteristic = NULL;
-BLECharacteristic *logCharacteristic = NULL;
 bool deviceConnected = false;
 
 // ✅ Pinos das bombas (ajuste conforme seu circuito)
@@ -66,6 +94,108 @@ Bomb bombas[3];
 bool bombaJaAcionada[3] = {false, false, false};
 
 Preferences preferences; // Para salvar as configurações na memória flash
+
+String getTokenType(TokenInfo info) {
+  switch (info.type) {
+    case token_type_undefined:
+      return "undefined";
+    case token_type_legacy_token:
+      return "legacy token";
+    case token_type_id_token:
+      return "id token";
+    case token_type_custom_token:
+      return "custom token";
+    case token_type_oauth2_access_token:
+      return "OAuth2.0 access token";
+    default:
+      return "unknown";
+  }
+}
+
+String getTokenStatus(TokenInfo info) {
+  switch (info.status) {
+    case token_status_uninitialized:
+      return "uninitialized";
+    case token_status_on_signing:
+      return "on signing";
+    case token_status_on_request:
+      return "on request";
+    case token_status_on_refresh:
+      return "on refreshing";
+    case token_status_ready:
+      return "ready";
+    case token_status_error:
+      return "error";
+    default:
+      return "unknown";
+  }
+}
+
+
+bool conectarWiFi() {
+  Serial.print("🔗 Conectando ao Wi-Fi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Wi-Fi conectado!");
+    Serial.print("📡 IP Local: ");
+    Serial.println(WiFi.localIP());
+
+    int rssi = WiFi.RSSI();
+    Serial.print("📶 Intensidade do sinal Wi-Fi (RSSI): ");
+    Serial.print(rssi);
+    Serial.println(" dBm");
+
+    // 🔥 Se quiser, pode transformar em texto:
+    if (rssi >= -50) {
+      Serial.println("🔋 Sinal Excelente");
+    } else if (rssi >= -60) {
+      Serial.println("🔋 Sinal Muito Bom");
+    } else if (rssi >= -70) {
+      Serial.println("🔋 Sinal Regular");
+    } else {
+      Serial.println("⚠️ Sinal Fraco");
+    }
+
+    return true;
+  } else {
+    Serial.println("\n❌ Falha ao conectar no Wi-Fi.");
+    return false;
+  }
+}
+
+void tokenStatusCallback(TokenInfo info) {
+  Serial.printf("🛡️ Token info: type = %s, status = %s\n",
+                getTokenType(info).c_str(),
+                getTokenStatus(info).c_str());
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  auth.user.email = "rafaelrodrigues.dsg3d@gmail.com";
+  auth.user.password = "@FireDoser123";
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (Firebase.ready()) {
+    Serial.println("✅ Firebase conectado e pronto!");
+  } else {
+    Serial.println("❌ Firebase não conectado.");
+  }
+}
 
 // Função para carregar configuração das bombas salvas na memória flash
 void loadBombasConfig()
@@ -132,47 +262,30 @@ void loadBombasConfig()
   }
 }
 
-void adicionarLog(int bombaIndex, float dosagem, String origem)
-{
-  // Monta o timestamp
+void adicionarLogFirebase(int bombaIndex, float dosagem, String origem) {
   DateTime now = rtc.now();
-  char timestamp[20];
-  snprintf(timestamp, sizeof(timestamp), "%02d/%02d/%04d %02d:%02d",
-           now.day(), now.month(), now.year(), now.hour(), now.minute());
+  String path = "/logs/";
+  path += String(now.unixtime());
 
-  // Lê os logs salvos
-  String logsStr = preferences.getString("logs", "[]");
-  DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, logsStr);
-  if (error)
-  {
-    Serial.println("❌ [log] Erro ao carregar logs: " + String(error.c_str()));
-    doc.to<JsonArray>(); // inicia vazio
+  FirebaseJson json;
+  String timestamp = String(now.day()) + "/" + String(now.month()) + "/" + String(now.year()) + " " + String(now.hour()) + ":" + String(now.minute());
+
+  json.set("timestamp", timestamp);
+  json.set("bomba", bombas[bombaIndex].name);
+  json.set("dosagem", dosagem);
+  json.set("origem", origem);
+
+  Serial.print("🔄 Tentando enviar para Firebase em ");
+  Serial.println(path);
+
+  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+    Serial.println("✅ Log enviado para Firebase.");
+  } else {
+    Serial.print("❌ Erro ao enviar log: ");
+    Serial.println(fbdo.errorReason());
   }
-
-  JsonArray logs = doc.as<JsonArray>();
-
-  // Adiciona o novo log
-  JsonObject log = logs.createNestedObject();
-  log["ts"] = timestamp;
-  log["b"] = bombas[bombaIndex].name;
-  log["d"] = dosagem;
-  log["o"] = origem;
-
-  // Limita a quantidade de logs armazenados
-  const int MAX_LOGS = 50;
-  while (logs.size() > MAX_LOGS)
-  {
-    logs.remove(0); // remove o mais antigo
-  }
-
-  // Salva novamente na memória
-  String output;
-  serializeJson(logs, output);
-  preferences.putString("logs", output);
-
-  Serial.println("📝 [log] Log adicionado: " + output);
 }
+
 
 // Função para acionar a bomba sem registrar log
 void acionarBomba(int bombaIndex, float dosagem, String origem)
@@ -194,12 +307,17 @@ void acionarBomba(int bombaIndex, float dosagem, String origem)
     }
 
   Serial.println("🚰 [acionarBomba] Acionando Bomba " + String(bombaIndex + 1) + " (" + bombas[bombaIndex].name + ") por " + String(tempoAtivacao) + "ms");
-  // adicionarLog(bombaIndex, dosagem, origem);
   digitalWrite(pinoBomba, HIGH);
+
   unsigned long tempoInicio = millis();
-    while (millis() - tempoInicio < tempoAtivacao) {}
-  digitalWrite(pinoBomba, LOW);
-  Serial.println("✅ [acionarBomba] Bomba " + String(bombaIndex + 1) + " desligada!");
+
+    while (millis() - tempoInicio < tempoAtivacao) {
+      delay(10);
+    }
+
+    
+    digitalWrite(pinoBomba, LOW);
+    Serial.println("✅ [acionarBomba] Bomba " + String(bombaIndex + 1) + " desligada!");
 
   // ✅ Atualiza o estoque: desconta a dosagem, garantindo que não fique negativo
   if (bombas[bombaIndex].quantidadeEstoque > 0)
@@ -236,6 +354,18 @@ void acionarBomba(int bombaIndex, float dosagem, String origem)
     preferences.putString("bombas", newConfigJson);
     Serial.println("✅ [acionarBomba] Estoque atualizado na memória flash!");
   }
+
+
+      int nextTail = (pendingTail + 1) % MAX_PENDING_LOGS;
+      if (nextTail != pendingHead) {
+
+        DateTime now = rtc.now();
+        pendingLogs[pendingTail++] = { bombaIndex, dosagem, origem, now };
+        pendingTail = nextTail;
+        Serial.println("🔖 Log enfileirado para envio futuro.");
+      } else {
+        Serial.println("⚠️ Fila de logs cheia, descartando log.");
+      }
 }
 
 
@@ -273,17 +403,37 @@ class TimeCharacteristicCallbacks : public BLECharacteristicCallbacks
     Serial.println("📥 [TimeCharacteristic] Hora recebida: " + String(value.c_str()));
 
     int dia, mes, ano, hora, minuto, segundo;
-    if (sscanf(value.c_str(), "%d/%d/%d %d:%d:%d", &dia, &mes, &ano, &hora, &minuto, &segundo) == 6)
+    // tenta ler com segundos
+    int parsed = sscanf(value.c_str(), "%d/%d/%d %d:%d:%d",
+                        &dia, &mes, &ano, &hora, &minuto, &segundo);
+    if (parsed == 6)
     {
-      rtc.adjust(DateTime(ano, mes, dia, hora, minuto, segundo));
-      Serial.printf("✅ [TimeCharacteristic] Data e hora ajustadas para: %02d/%02d/%04d %02d:%02d:%02d\n", dia, mes, ano, hora, minuto, segundo);
+      // tudo ok, já temos segundos
     }
     else
     {
-      Serial.println("❌ [TimeCharacteristic] Formato inválido! Esperado: DD/MM/YYYY HH:MM:SS");
+      // tenta ler apenas dia/mês/ano hora:minuto
+      parsed = sscanf(value.c_str(), "%d/%d/%d %d:%d",
+                      &dia, &mes, &ano, &hora, &minuto);
+      if (parsed == 5)
+      {
+        segundo = 0; // assume zero
+        Serial.println("ℹ️ [TimeCharacteristic] Sem segundos, assumindo 00");
+      }
+      else
+      {
+        Serial.println("❌ [TimeCharacteristic] Formato inválido! Esperado: DD/MM/YYYY HH:MM[:SS]");
+        return;
+      }
     }
+
+    // Se chegou aqui, temos dia, mês, ano, hora, minuto e segundo (talvez =0)
+    rtc.adjust(DateTime(ano, mes, dia, hora, minuto, segundo));
+    Serial.printf("✅ [TimeCharacteristic] Data e hora ajustadas para: %02d/%02d/%04d %02d:%02d:%02d\n",
+                  dia, mes, ano, hora, minuto, segundo);
   }
 };
+
 
 class MyServerCallbacks : public BLEServerCallbacks
 {
@@ -470,48 +620,6 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks
   }
 };
 
-class LogCharacteristicCallbacks : public BLECharacteristicCallbacks
-{
-  void onRead(BLECharacteristic *pCharacteristic) override
-  {
-    String logsStr = preferences.getString("logs", "[]");
-
-    // Limitar quantidade para não travar BLE (ex: últimos 10)
-    DynamicJsonDocument doc(1024);
-    deserializeJson(doc, logsStr);
-    JsonArray fullLogs = doc.as<JsonArray>();
-
-    DynamicJsonDocument smallDoc(512);
-    JsonArray limitedLogs = smallDoc.to<JsonArray>();
-
-    const int MAX_RETURN = 20;
-    int start = std::max(0, static_cast<int>(fullLogs.size()) - MAX_RETURN);
-
-    for (int i = start; i < fullLogs.size(); i++)
-    {
-      limitedLogs.add(fullLogs[i]);
-    }
-
-    String result;
-    serializeJson(limitedLogs, result);
-    pCharacteristic->setValue(result.c_str());
-
-    Serial.println("📤 [log] Enviando últimos logs BLE:");
-    Serial.println(result);
-  }
-
-  void onWrite(BLECharacteristic *pCharacteristic) override
-  {
-    std::string value = pCharacteristic->getValue();
-    if (value == "CLEAR")
-    {
-      preferences.putString("logs", "[]");
-      pCharacteristic->setValue("Logs apagados!");
-      Serial.println("🗑️ [log] Todos os logs foram apagados.");
-    }
-  }
-};
-
 
 // Inicialização
 
@@ -529,7 +637,9 @@ void inicializarBombas()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("🚀 [setup] Iniciando ESP32 como Servidor BLE...");
+  conectarWiFi();
+  initFirebase(); 
+  Serial.println("🚀 [setup] Iniciando ESP32 com os servidores...");
 
   if (!rtc.begin())
   {
@@ -548,7 +658,7 @@ void setup()
   // Carrega configurações salvas (se houver)
   loadBombasConfig();
 
-  BLEDevice::init("ESP32_Aquario");
+  BLEDevice::init("ESP32_Aquario2");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
@@ -574,12 +684,6 @@ void setup()
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
   configCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
 
-  // ✅ Característica de Log (Leitura e Escrita)
-  logCharacteristic = pService->createCharacteristic(
-      LOG_CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  logCharacteristic->setCallbacks(new LogCharacteristicCallbacks());
-
 
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -589,57 +693,128 @@ void setup()
   Serial.println("✅ [setup] Servidor BLE pronto!");
 }
 
-void loop()
-{
-    static int ultimoMinuto = -1;
-    static unsigned long lastCheckTime = 0; // Controle para rodar o loop a cada 1s
+void loop() {
+  // ─── 0) Garantir Wi-Fi conectado ───
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ Wi-Fi caiu, reconectando...");
+    conectarWiFi();
+  }
 
-    // ✅ Executa apenas se passou 1 segundo desde a última execução
-    if (millis() - lastCheckTime >= 1000)
-    {
-        lastCheckTime = millis(); // Atualiza o tempo da última checagem
+  // ─── 1) Envio de 1 log pendente a cada LOG_INTERVAL ───
+  if (pendingHead != pendingTail && millis() - lastLogAttempt >= LOG_INTERVAL) {
+    lastLogAttempt = millis();
+    PendingLog &lg = pendingLogs[pendingHead];
 
-        DateTime now = rtc.now();
-        int diaSemana = now.dayOfTheWeek();
-        const char *diasSemanaNomes[] = {"Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"};
+    // Prepara caminho e JSON
+    String path = "/logs/" + String(lg.timestamp.unixtime());
+    FirebaseJson json;
+    String ts = String(lg.timestamp.day()) + "/"
+              + String(lg.timestamp.month()) + "/"
+              + String(lg.timestamp.year()) + " "
+              + String(lg.timestamp.hour()) + ":"
+              + String(lg.timestamp.minute());
+    json.set("timestamp", ts);
+    json.set("bomba",   bombas[lg.bombaIndex].name);
+    json.set("dosagem", lg.dosagem);
+    json.set("origem",  lg.origem);
 
-        // ✅ Só imprime a hora quando o minuto muda
-        if (now.minute() != ultimoMinuto)
-        {
-            ultimoMinuto = now.minute();  // Atualiza o minuto salvo
+    Serial.print("🔄 Tentando enviar log pendente em ");
+    Serial.println(path);
 
-            // Atualiza a característica BLE com a hora
-            char timeString[20];
-            snprintf(timeString, sizeof(timeString), "%02d/%02d/%04d %02d:%02d", 
-                     now.day(), now.month(), now.year(), now.hour(), now.minute());
-            timeCharacteristic->setValue(timeString);
-            timeCharacteristic->notify();
-
-            // ✅ Printa a hora apenas uma vez por minuto
-            Serial.printf("📅 Data atual: %02d/%02d/%04d (%s)\n", now.day(), now.month(), now.year(), diasSemanaNomes[diaSemana]);
-            Serial.printf("🕒 Hora atual: %02d:%02d\n", now.hour(), now.minute());
-            Serial.println("🔄 Reiniciando status das bombas para novo minuto.");
-
-            // ✅ Reseta a flag de acionamento das bombas
-            for (int i = 0; i < 3; i++)
-            {
-                bombaJaAcionada[i] = false;
-            }
-        }
-
-        // ✅ Verifica se alguma bomba precisa ser acionada
-        for (int i = 0; i < 3; i++)
-        {
-            if (bombas[i].status && !bombaJaAcionada[i] &&
-                bombas[i].hour == now.hour() && bombas[i].minute == now.minute() &&
-                bombas[i].diasSemana[diaSemana])
-            {
-                Serial.printf("⏳ Acionando bomba %d (%s) às %02d:%02d no dia %s\n",
-                              i + 1, bombas[i].name.c_str(), now.hour(), now.minute(), diasSemanaNomes[diaSemana]);
-
-                acionarBomba(i, bombas[i].dosagem, "Programado");
-                bombaJaAcionada[i] = true;
-            }
-        }
+    // 1.a) Forçar refresh do token se necessário
+    if (!Firebase.ready() &&
+        millis() - lastFirebaseReconnectAttempt > firebaseReconnectInterval) {
+      lastFirebaseReconnectAttempt = millis();
+      Serial.println("🔄 Firebase não está pronto. Tentando renovar token...");
+      Firebase.refreshToken(&config);
+      Firebase.begin(&config, &auth);
+      if (Firebase.ready()) {
+        Serial.println("✅ Firebase reconectado com sucesso!");
+      } else {
+        Serial.print("❌ Erro ao reconectar Firebase: ");
+        Serial.println(fbdo.errorReason());
+      }
     }
+
+    // 1.b) Tentar enviar, renovado ou não
+    if (Firebase.ready() && Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+      Serial.println("✅ Log pendente enviado!");
+      pendingHead = (pendingHead + 1) % MAX_PENDING_LOGS;
+    } else {
+      Serial.print("❌ Falha ao enviar log: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  // ─── 2) Lógica de 1s: atualização de hora BLE e acionamento programado ───
+  static int ultimoMinuto = -1;
+  static unsigned long lastCheckTime = 0;
+
+  if (millis() - lastCheckTime >= 1000) {
+    lastCheckTime = millis();
+    DateTime now = rtc.now();
+    int diaSemana = now.dayOfTheWeek();
+    const char *diasSemanaNomes[] = {
+      "Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"
+    };
+
+    // 2.a) Notificar BLE só quando o minuto muda
+    if (now.minute() != ultimoMinuto) {
+      ultimoMinuto = now.minute();
+
+      // ─── Monta JSON de status ───
+      DynamicJsonDocument statusDoc(256);
+
+      // 1) Hora formatada
+      char buf[20];
+      snprintf(buf, sizeof(buf),
+               "%02d/%02d/%04d %02d:%02d",
+               now.day(), now.month(), now.year(),
+               now.hour(), now.minute());
+      statusDoc["time"] = buf;
+
+      // 2) Status do Wi-Fi
+      bool wifiOk = (WiFi.status() == WL_CONNECTED);
+      statusDoc["wifi"]["connected"] = wifiOk;
+      statusDoc["wifi"]["rssi"]      = wifiOk ? WiFi.RSSI() : 0;
+
+      // 3) Status do Firebase
+      statusDoc["firebase"]["ready"] = Firebase.ready();
+
+      // Serializa e notifica via BLE
+      String payload;
+      serializeJson(statusDoc, payload);
+      timeCharacteristic->setValue(payload.c_str());
+      timeCharacteristic->notify();
+
+      // Também log no Serial para debug
+      Serial.printf("📅 %02d/%02d/%04d (%s)\n",
+                    now.day(), now.month(), now.year(),
+                    diasSemanaNomes[diaSemana]);
+      Serial.printf("🕒 %02d:%02d\n", now.hour(), now.minute());
+      Serial.println("🔄 Resetando flags de acionamento");
+      for (int i = 0; i < 3; i++) {
+        bombaJaAcionada[i] = false;
+      }
+    }
+
+    // 2.b) Acionamento programado das bombas
+    for (int i = 0; i < 3; i++) {
+      if (bombas[i].status &&
+          !bombaJaAcionada[i] &&
+          bombas[i].hour   == now.hour()   &&
+          bombas[i].minute == now.minute() &&
+          bombas[i].diasSemana[diaSemana]) {
+        Serial.printf("⏳ Programado: bomba %d (%s) às %02d:%02d\n",
+                      i+1, bombas[i].name.c_str(),
+                      now.hour(), now.minute());
+        acionarBomba(i, bombas[i].dosagem, "Programado");
+        bombaJaAcionada[i] = true;
+      }
+    }
+  }
 }
+
+
+
+
